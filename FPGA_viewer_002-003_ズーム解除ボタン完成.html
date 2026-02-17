@@ -1,0 +1,1036 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>MIP FPGA ログ読込テスト（前処理のみ）</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 16px;
+    }
+    h1 {
+      font-size: 1.4rem;
+      margin-bottom: 0.5rem;
+    }
+    .panel {
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+    .panel-title {
+      font-weight: bold;
+      margin-bottom: 6px;
+    }
+    #status {
+      font-size: 0.9rem;
+      white-space: pre-line;
+    }
+    #summary {
+      font-size: 0.9rem;
+      white-space: pre-line;
+    }
+    button:disabled {
+      opacity: 0.5;
+    }
+  </style>
+
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+
+</head>
+
+<body>
+
+  <h1>MIP FPGA ログ読込テスト（前処理モジュール）</h1>
+
+    <!-- ===============================
+      計測ファイルと解析条件
+    =============================== -->
+    <div class="panel">
+      <div class="panel-title">計測ファイルと解析条件</div>
+
+      <!-- FPGAログファイル -->
+      <div>
+        FPGAログファイル：
+        <input type="file" id="fpgaFileInput" accept=".txt">
+      </div>
+
+      <!-- IP位置ファイル -->
+      <div style="margin-top: 6px;">
+        IP_position.csv：
+        <input type="file" id="ipPosFileInput" accept=".csv">
+      </div>
+
+      <!-- ▼ 追加（サンプリング周波数）-->
+      <div style="margin-top: 6px;">
+        サンプリング周波数（MHz）：
+        <input
+          type="number"
+          id="samplingFreq"
+          value="150"
+          min="1"
+          step="1"
+          style="width:80px;"
+        />
+      </div>
+
+      <button id="parseButton" disabled>FPGAデータ解析</button>
+      <button id="downloadCsvButton" disabled>CSVダウンロード</button>
+      <div id="status"></div>
+    </div>
+
+
+  <script>
+    // ---------------------------------------------
+    // アプリ全体の状態管理（後で他モジュールからも参照可能）
+    // ---------------------------------------------
+    const AppState = {
+      rawText: null,          // FPGAログ生テキスト
+      parsed: null,           // 解析済みデータ（FpgaParserの戻り値）
+
+      ipPositionRows: null,   // IP_position.csv の各行オブジェクト配列
+      enabledChannels: null,  // 有効チャネル（0始まりの番号配列）
+
+      samplingFreqMHz: 150,   // FPGAサンプリング周波数（MHz）
+
+      records: null,          // records の配列本体
+      currentTime: null,      // 現在時刻（カウント）
+      minTime: null,          // 有効範囲 min（カウント）
+      maxTime: null,          // 有効範囲 max（カウント）
+      zoomEnabled: true       // 2. の scrollZoom 有効／無効（初期値 ON）
+    };
+
+    // ---------------------------------------------
+    // FPGA ログ解析モジュール
+    //  - XMD% mrd 0x40000000 ... : value ブロック
+    //  - XMD% mrd 0x42000000 ... : time ブロック
+    // ---------------------------------------------
+    const FpgaParser = (function () {
+
+      /**
+       * 指定マーカー行の直後から、空行 or 次の "XMD%" までを対象に
+       * 32bit HEX を抽出し、2行ペアを 64bit HEX に連結して配列で返す。
+       *
+       * @param {string[]} lines - ログ全行
+       * @param {string} startMarker - 例: "XMD% mrd 0x40000000"
+       * @returns {string[]} - 64bit HEX（上位32bit + 下位32bit） の配列
+       */
+      function extractHex64List(lines, startMarker) {
+        const hex64List = [];
+        let startIdx = null;
+
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].includes(startMarker)) {
+            startIdx = i;
+            break;
+          }
+        }
+        if (startIdx === null) {
+          return hex64List; // 見つからなければ空
+        }
+
+        const dataLines = [];
+        for (let i = startIdx + 1; i < lines.length; i++) {
+          const raw = lines[i];
+          const trimmed = raw.trim();
+
+          if (!trimmed) break;                 // 空行で終了
+          if (trimmed.startsWith("XMD%")) break; // 次のコマンドで終了
+
+          // 例: "40000000:   00000000"
+          const parts = raw.split(":");
+          if (parts.length < 2) continue;
+
+          // コロン以降、最初のトークンを HEX として扱う
+          const afterColon = parts[1].trim();
+          if (!afterColon) continue;
+
+          const hexToken = afterColon.split(/\s+/)[0].trim();
+          if (!hexToken) continue;
+
+          dataLines.push(hexToken);
+        }
+
+        // 2行ペア（下位32bit → 上位32bit）を 64bit に連結
+        for (let i = 0; i + 1 < dataLines.length; i += 2) {
+          const lower = dataLines[i];       // 下位32bit
+          const upper = dataLines[i + 1];   // 上位32bit
+          const hex64 = upper.padStart(8, "0") + lower.padStart(8, "0");
+          hex64List.push(hex64.toUpperCase());
+        }
+
+        return hex64List;
+      }
+
+      /**
+       * FPGA ログ全体を解析し、
+       *  - valueHexList: 64bit値の配列
+       *  - timeHexList : 64bitタイムスタンプの配列
+       *  - records     : index / timeHex / timeDec / valueHex / bits[0..63]
+       * を返す。
+       *
+       * @param {string} text - ログ生テキスト
+       * @returns {object}
+       */
+      function parseFpgaLog(text) {
+        const lines = text.split(/\r?\n/);
+
+        const valueHexList = extractHex64List(lines, "XMD% mrd 0x40000000");
+        const timeHexList  = extractHex64List(lines, "XMD% mrd 0x42000000");
+
+        const minLen = Math.min(valueHexList.length, timeHexList.length);
+        const records = [];
+
+        for (let i = 0; i < minLen; i++) {
+          const valueHex = valueHexList[i];
+          const timeHex  = timeHexList[i];
+
+          // 64bit 値 → BigInt
+          let valueBig = 0n;
+          let timeBig  = 0n;
+          try {
+            valueBig = BigInt("0x" + valueHex);
+            timeBig  = BigInt("0x" + timeHex);
+          } catch (e) {
+            // パースに失敗した場合、そのレコードはスキップ
+            continue;
+          }
+
+          // 64bit を LSB→MSB で配列 bits[0..63] に展開
+          const bits = new Array(64);
+          for (let b = 0; b < 64; b++) {
+            const bit = (valueBig >> BigInt(b)) & 1n;
+            bits[b] = bit === 1n ? 1 : 0;
+          }
+
+          records.push({
+            index: i,
+            timeHex: timeHex,
+            timeDec: timeBig.toString(),   // 10進文字列
+            valueHex: valueHex,
+            bits: bits                     // 0/1 の配列
+          });
+        }
+
+        return {
+          valueHexList,
+          timeHexList,
+          records
+        };
+      }
+
+      // 公開API
+      return {
+        parseFpgaLog
+      };
+    })();
+
+    // ---------------------------------------------
+    // UI 初期化
+    // ---------------------------------------------
+    (function initUi() {
+      const fileInput  = document.getElementById("fpgaFileInput");
+      const ipPosInput  = document.getElementById("ipPosFileInput"); 
+      const parseBtn   = document.getElementById("parseButton");
+      const statusEl   = document.getElementById("status");
+
+      fileInput.addEventListener("change", (event) => {
+        const file = event.target.files[0];
+        if (!file) {
+          statusEl.textContent = "ファイルが選択されていません。";
+          parseBtn.disabled = true;
+          AppState.rawText = null;
+          return;
+        }
+
+        statusEl.textContent = `ファイル読込中: ${file.name}`;
+        const reader = new FileReader();
+
+        reader.onload = () => {
+          AppState.rawText = reader.result;
+          statusEl.textContent = `ファイル読込完了: ${file.name}\n解析ボタンを押してください。`;
+          parseBtn.disabled = false;
+        };
+
+        reader.onerror = () => {
+          statusEl.textContent = `ファイル読込に失敗しました: ${reader.error}`;
+          parseBtn.disabled = true;
+          AppState.rawText = null;
+        };
+
+        reader.readAsText(file);  // FPGAログはテキストファイル
+      });
+
+        // IP_position.csv 読み込み
+        if (ipPosInput) {
+            ipPosInput.addEventListener("change", (event) => {
+            const file = event.target.files[0];
+            if (!file) {
+                statusEl.textContent = "IP_position.csv が選択されていません。";
+                AppState.ipPositionRows = null;
+                AppState.enabledChannels = null;
+                return;
+            }
+
+            statusEl.textContent = `IP_position.csv 読込中: ${file.name}`;
+
+            const reader = new FileReader();
+            reader.onload = () => {
+                const text = reader.result;
+                const rows = parseIpPositionCsv(text);
+                const enabled = getEnabledChannelsFromIpRows(rows);
+
+                AppState.ipPositionRows = rows;
+                AppState.enabledChannels = enabled;
+
+                statusEl.textContent =
+                `IP_position.csv 読込完了: ${file.name}\n` +
+                `有効チャネル数: ${enabled.length}`;
+            };
+            reader.onerror = () => {
+                statusEl.textContent = `IP_position.csv 読込に失敗しました: ${reader.error}`;
+                AppState.ipPositionRows = null;
+                AppState.enabledChannels = null;
+            };
+
+            reader.readAsText(file);
+            });
+        }
+
+      
+      parseBtn.addEventListener("click", () => {
+        if (!AppState.rawText) {
+          statusEl.textContent = "ログが読み込まれていません。";
+          return;
+        }
+        statusEl.textContent = "解析中…";
+
+        const t0 = performance.now();
+        const parsed = FpgaParser.parseFpgaLog(AppState.rawText);
+        const t1 = performance.now();
+
+        AppState.parsed = parsed;
+        AppState.records = parsed.records; 
+
+        document.getElementById("downloadCsvButton").disabled = false;
+
+        const nValue = parsed.valueHexList.length;
+        const nTime  = parsed.timeHexList.length;
+        const nRec   = parsed.records.length;
+
+        let summaryText = "";
+        summaryText += `valueHex  配列長: ${nValue}\n`;
+        summaryText += `timeHex   配列長: ${nTime}\n`;
+        summaryText += `有効レコード数: ${nRec}\n`;
+        if (nRec > 0) {
+          const first = parsed.records[0];
+          const last  = parsed.records[nRec - 1];
+          summaryText += "\n先頭レコード:\n";
+          summaryText += `  index   = ${first.index}\n`;
+          summaryText += `  timeHex = ${first.timeHex}\n`;
+          summaryText += `  timeDec = ${first.timeDec}\n`;
+          summaryText += `  valueHex= ${first.valueHex}\n`;
+          summaryText += "\n末尾レコード:\n";
+          summaryText += `  index   = ${last.index}\n`;
+          summaryText += `  timeHex = ${last.timeHex}\n`;
+          summaryText += `  timeDec = ${last.timeDec}\n`;
+          summaryText += `  valueHex= ${last.valueHex}\n`;
+        }
+
+        statusEl.textContent = `解析完了 (${(t1 - t0).toFixed(1)} ms)`;
+      });
+
+      // ▼ サンプリング周波数（MHz）入力イベント
+        const samplingFreqInput = document.getElementById("samplingFreq");
+        samplingFreqInput.addEventListener("input", (e) => {
+        AppState.samplingFreqMHz = Number(e.target.value);
+      });
+
+
+    })();
+
+    // ---------------------------------------------
+    // CSV 生成（Python版出力形式に合わせた形）
+    // ---------------------------------------------
+    function generateCsv(records) {
+        // ヘッダ行
+        const header = [
+        "index", "timeHex", "timeDec", "valueHex",
+        ...Array.from({ length: 64 }, (_, i) => "D" + (i + 1))
+        ];
+        const lines = [header.join(",")];
+
+        // データ部
+        for (const rec of records) {
+        const row = [
+            rec.index,
+            rec.timeHex,
+            rec.timeDec,
+            rec.valueHex,
+            ...rec.bits
+        ];
+        lines.push(row.join(","));
+        }
+
+        // まとめて返す
+        return lines.join("\n");
+    }
+
+    // ------------------------------------------------------
+    // IP_position.csv をパースして {IP: "D21", ...} の配列を返す
+    // ここでは「タブ区切り」を想定（必要なら delimiter を変更）
+    // ------------------------------------------------------
+    function parseIpPositionCsv(text) {
+        const lines = text.trim().split(/\r?\n/);
+        if (lines.length === 0) return [];
+
+        // ===== ヘッダ行 =====
+        const headerLine = lines[0];
+        const headerCols = headerLine
+            .replace(/^\uFEFF/, "")      // BOM除去
+            .split(/[\t,]+/);            // ★タブ/カンマ両対応
+
+        // 列インデックス取得
+        const idxIP = headerCols.findIndex(col => col.trim() === "IP");
+        const idxX  = headerCols.findIndex(col => col.trim() === "x");
+        const idxY  = headerCols.findIndex(col => col.trim() === "y");
+
+        if (idxIP === -1 || idxX === -1 || idxY === -1) {
+            console.warn("IP_position.csv に IP, x, y の列が見つかりません");
+            return [];
+        }
+
+        const rows = [];
+
+        // ===== データ行 =====
+        for (let i = 1; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (!line) continue;
+
+            const cols = line.split(/[\t,]+/);    // ★タブ/カンマ両対応
+            if (cols.length <= idxY) continue;
+
+            rows.push({
+                IP: cols[idxIP].trim(),
+                x : Number(cols[idxX]),
+                y : Number(cols[idxY])
+            });
+        }
+
+        // ===== AppState に格納 =====
+        AppState.ipPositionRows = rows;
+
+        // ===== 初期描画 =====
+        updateIpPositionPlot();
+
+        return rows;
+    }
+
+
+    // ------------------------------------------------------
+    // IP_position の {IP: "D21"} 配列から、チャネル番号配列 [20,21,...] を作成
+    //  D1 → 0, D2 → 1, ..., D64 → 63 の変換
+    // ------------------------------------------------------
+    function getEnabledChannelsFromIpRows(ipRows) {
+    if (!ipRows || ipRows.length === 0) {
+        return [];
+    }
+
+    const list = [];
+
+    for (const row of ipRows) {
+        const ip = row.IP;
+        if (!ip || !ip.startsWith("D")) continue;
+
+        const n = Number(ip.substring(1)); // "21" → 21
+        if (!Number.isInteger(n)) continue;
+        if (n < 1 || n > 64) continue;
+
+        const chIndex = n - 1; // 0始まりに変換
+        list.push(chIndex);
+    }
+
+    // 重複除去 + ソート
+    const uniq = Array.from(new Set(list));
+    uniq.sort((a, b) => a - b);
+
+    return uniq;
+    }
+
+
+    // ---------------------------------------------
+    // CSV ダウンロード機能
+    // ---------------------------------------------
+    (function initCsvDownload() {
+        const btn = document.getElementById("downloadCsvButton");
+        if (!btn) return;
+
+        btn.addEventListener("click", () => {
+        // 解析済みデータがない場合は何もしない
+        if (!AppState.parsed || !AppState.parsed.records) {
+            alert("解析が実行されていません。");
+            return;
+        }
+
+        // CSV テキスト生成
+        const csvText = generateCsv(AppState.parsed.records);
+
+        // Blob → ObjectURL → ダウンロード
+        const blob = new Blob([csvText], { type: "text/csv" });
+        const url = URL.createObjectURL(blob);
+
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "fpga_records.csv";
+        a.click();
+
+        URL.revokeObjectURL(url);
+        });
+    })();
+
+
+  </script>
+
+  <div class="panel">
+    <div class="panel-title">2. 時系列グラフ（time_dec vs ch）</div>
+    <button id="zoomToggleBtn" style="margin: 6px 0; padding: 4px 10px;">
+      Zoom ON
+    </button>
+    <div id="timeseriesPlot" style="width: 100%; height: 400px;"></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">3. イオンプローブ位置表示（XY）</div>
+    <div id="ipPosPlot" style="width: 100%; height: 450px;"></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">4. 時間制御（IP反応表示）</div>
+    <input id="timeSlider" type="range" min="0" max="100" step="0.1" value="0" style="width: 100%;">
+    <div id="timeSliderValue" style="text-align: center; margin-top: 5px;">time = 0</div>
+  </div>
+
+  <script>
+
+    // カウント数 → 時間[s] 変換
+    function countToSeconds(count) {
+        const fsHz = AppState.samplingFreqMHz * 1e6;
+        if (!fsHz || !isFinite(fsHz)) {
+            return count;  // フォールバック（周波数未設定時）
+        }
+        return count / fsHz;
+    }
+
+    // ---------------------------------------------
+    // 時系列矩形波トレース（切り替え点のみ、縦方向オフセット付き）
+    // ---------------------------------------------
+    function buildTimeSeriesTrace(records, enabledChannels) {
+    const traces = [];
+    const OFFSET = 1.2;
+
+    // IP_position.csv が読み込まれていない場合は、全64chを対象
+    const channels = (enabledChannels && enabledChannels.length > 0)
+        ? enabledChannels
+        : Array.from({ length: 64 }, (_, i) => i);  // [0,1,...,63]
+
+    for (let idx = 0; idx < channels.length; idx++) {
+        const ch = channels[idx];  // 実チャネル番号（0〜63）
+
+        let prev = null;
+        const x = [];
+        const y = [];
+
+        for (const rec of records) {
+        const tCount = Number(rec.timeDec);          // カウント
+        const t = countToSeconds(tCount);            // 秒に変換
+        const sig = rec.bits[ch];  // 0 or 1
+
+        if (prev === null) {
+            x.push(t);
+            y.push((1 - sig) + idx * OFFSET);  // ← 表示上の縦位置は idx で決める
+            prev = sig;
+            continue;
+        }
+
+        if (sig !== prev) {
+            x.push(t);
+            y.push((1 - sig) + idx * OFFSET);
+            prev = sig;
+        }
+        }
+
+        traces.push({
+        x: x,
+        y: y,
+        mode: "lines",
+        type: "scatter",
+        line: {
+            width: 1,
+            shape: "vh"
+        },
+        name: "D" + (ch + 1)   // ラベル表示だけ D1〜D64
+        });
+    }
+
+    return traces;
+    }
+
+    // ★ 指定時刻でのビット配列（64ch）を取得
+    function getBitsAtTime(t) {
+        // 解析結果は AppState.parsed.records に入っている
+        if (!AppState.parsed || !AppState.parsed.records || AppState.parsed.records.length === 0) {
+            return null;
+        }
+
+        const records = AppState.parsed.records;
+
+        // t に最も近い timeDec のレコードを取得
+        let best = records[0];
+        let bestDiff = Math.abs(Number(best.timeDec) - t);
+
+        for (let i = 1; i < records.length; i++) {
+            const rec = records[i];
+            const diff = Math.abs(Number(rec.timeDec) - t);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                best = rec;
+            }
+        }
+
+        return best.bits;
+    }
+
+    
+    function updateIpPositionPlot() {
+
+        // ★ 現在時刻のビット配列取得
+        const bits = getBitsAtTime(AppState.currentTime);
+        if (!bits) return;
+
+        const scatter = {
+            x: [],
+            y: [],
+            text: [],
+            mode: "markers+text",
+            textposition: "top center",
+            marker: {
+                size: 12,
+                color: []
+            }
+        };
+
+        AppState.ipPositionRows.forEach(pos => {
+            // "D21" → 20 などに変換
+            const idx = Number(pos.IP.replace("D", "")) - 1;
+            const isOn = bits[idx] === 1;
+
+            scatter.x.push(pos.x);
+            scatter.y.push(pos.y);
+            scatter.text.push(pos.IP);
+
+            // ★ 色切り替え
+            scatter.marker.color.push(isOn ? "red" : "lightgray");
+        });
+
+        const layout = {
+            title: "IP位置 (XY, mm)",
+            xaxis: { title: "x [mm]", zeroline: false, scaleanchor: "y", scaleratio: 1 },
+            yaxis: { title: "y [mm]", zeroline: false },
+            margin: { l: 60, r: 20, t: 40, b: 40 },
+            plot_bgcolor: "rgba(0,0,0,0)",
+            paper_bgcolor: "rgba(0,0,0,0)"
+        };
+
+        Plotly.newPlot("ipPosPlot", [scatter], layout);
+    }
+
+    function computeTimeRange() {
+        if (!AppState.records || AppState.records.length === 0) return;
+
+        const times = AppState.records
+            .map(r => Number(r.timeDec))
+            .filter(v => !isNaN(v));
+
+        if (times.length === 0) return;
+
+        AppState.minTime = Math.min(...times);
+        AppState.maxTime = Math.max(...times);
+    }
+
+    function updateIpPositionTime(timeDec) {
+
+        if (!AppState.records || !AppState.ipPositionRows) return;
+
+        // 最も近い時間のレコードを探す
+        let nearest = null;
+        let bestDiff = Infinity;
+
+        for (const rec of AppState.records) {
+            const dt = Math.abs(rec.timeDec - timeDec);
+            if (dt < bestDiff) {
+                bestDiff = dt;
+                nearest = rec;
+            }
+        }
+        if (!nearest) return;
+
+        // 点の色情報作成
+        const xs = [];
+        const ys = [];
+        const texts = [];
+        const colors = [];
+
+        for (const row of AppState.ipPositionRows) {
+            const ch = row.IP;
+            const idx = AppState.enabledChannels.indexOf(ch);
+
+            let val = 0;
+            if (idx >= 0) {
+                val = nearest.bits[idx];  // 0 or 1
+            }
+
+            xs.push(row.x);
+            ys.push(row.y);
+            texts.push(ch);
+
+            if (val === 1) {
+                colors.push("red");
+            } else {
+                colors.push("lightgray");
+            }
+        }
+
+        Plotly.restyle("ipPosPlot", {
+            x: [xs],
+            y: [ys],
+            text: [texts],
+            marker: { color: colors, size: 18 }
+        });
+    }
+
+    function updateTimeSeriesVline(timeDec) {
+        Plotly.relayout("timeseriesPlot", {
+            "shapes[0]": {
+                type: "line",
+                x0: timeDec,
+                x1: timeDec,
+                y0: 0,
+                y1: 1,
+                xref: "x",
+                yref: "paper",
+                line: {
+                    color: "red",
+                    width: 2,
+                    dash: "dot"
+                }
+            }
+        });
+    }
+
+
+    // Plotly による描画本体
+    function updateTimeSeriesPlot(records) {
+        // ★ records 引数 → AppState → parsed の順に参照
+        const recs =
+            records ||
+            AppState.records ||
+            (AppState.parsed && AppState.parsed.records);
+
+        if (!recs || recs.length === 0) {
+            const plotDiv = document.getElementById("timeseriesPlot");
+            if (plotDiv) {
+                plotDiv.innerHTML = "有効なレコードがありません。";
+            }
+            return;
+        }
+
+        // ★ AppState.records を常に最新にそろえる
+        AppState.records = recs;
+
+        // ★ IP_position.csv から決まった enabledChannels を使う
+        const traces = buildTimeSeriesTrace(recs, AppState.enabledChannels);
+
+        // =======================
+        // 1) timeDec の min/max を決める（layout より前）
+        // =======================
+
+        // ★ timeDec を数値化して min/max を算出
+        const allTimes = recs
+            .map(r => Number(r.timeDec))
+            .filter(v => !isNaN(v));
+
+        const globalMin = Math.min(...allTimes);
+        const globalMax = Math.max(...allTimes);
+
+        // ★ 初回のみ minTime/maxTime を全体レンジで初期化
+        if (AppState.minTime == null || AppState.maxTime == null) {
+            AppState.minTime = globalMin;
+            AppState.maxTime = globalMax;
+        }
+
+        // ★ currentTime が未設定なら min から開始、あればクランプ
+        if (AppState.currentTime == null) {
+            AppState.currentTime = AppState.minTime;
+        } else {
+            if (AppState.currentTime < AppState.minTime) {
+                AppState.currentTime = AppState.minTime;
+            }
+            if (AppState.currentTime > AppState.maxTime) {
+                AppState.currentTime = AppState.maxTime;
+            }
+        }
+
+        // debug（確認用）
+        console.log("init-range", AppState.minTime, AppState.maxTime);
+
+
+        // =======================
+        // 2) annotations 作成
+        // =======================
+
+        const annotations = [];
+        if (AppState.enabledChannels && AppState.enabledChannels.length > 0) {
+            AppState.enabledChannels.forEach((ch, idx) => {
+                annotations.push({
+                    x: 0.01,
+                    y: idx * 1.2 + 0.5,
+                    xref: "paper",
+                    yref: "y",
+                    text: "D" + (ch + 1),
+                    showarrow: false,
+                    bgcolor: "rgba(255,255,255,0.95)",
+                    bordercolor: "rgba(255,255,255,0)",
+                    borderpad: 1,
+                    font: {
+                        size: 12,
+                        color: traces[idx].line.color
+                    },
+                    align: "right"
+                });
+            });
+        }
+
+
+        // =======================
+        // 3) layout 作成（ここで初めて min/max を参照）
+        // =======================
+
+        const layout = {
+            title: "IP反応時系列グラフ",
+            annotations: annotations,
+            xaxis: {
+                title: "time [s]",
+                zeroline: false,
+                // ★ 現在の minTime/maxTime（カウント）を秒に変換して表示範囲に反映
+                range: [
+                    countToSeconds(AppState.minTime),
+                    countToSeconds(AppState.maxTime)
+                ]
+            },
+            yaxis: {
+                fixedrange: true,
+                showticklabels: false,
+                showline: false,
+                showgrid: false
+            },
+            showlegend: false,
+            margin: { l: 60, r: 10, t: 40, b: 40 },
+            plot_bgcolor: "rgba(0,0,0,0)",
+            paper_bgcolor: "rgba(0,0,0,0)",
+            dragmode: "pan"
+        };
+
+        // ★ currentTime の設定
+        if (AppState.currentTime == null) {
+            AppState.currentTime = AppState.minTime;
+        } else {
+            if (AppState.currentTime < AppState.minTime) {
+                AppState.currentTime = AppState.minTime;
+            }
+            if (AppState.currentTime > AppState.maxTime) {
+                AppState.currentTime = AppState.maxTime;
+            }
+        }
+
+
+
+        const config = {
+            responsive: true,
+            displaylogo: false,
+            // ★ Zoom ON/OFF をここで反映
+            scrollZoom: AppState.zoomEnabled
+        };
+
+        // ★ 描画本体
+        Plotly.react("timeseriesPlot", traces, layout, config);
+
+        // ★ 赤線を currentTime の位置に描く（秒に変換）
+        const lineSec = countToSeconds(AppState.currentTime);
+        Plotly.relayout("timeseriesPlot", {
+            shapes: [
+                {
+                    type: "line",
+                    x0: lineSec,
+                    x1: lineSec,
+                    y0: 0,
+                    y1: 1,
+                    xref: "x",
+                    yref: "paper",
+                    line: { color: "red", width: 2 }
+                }
+            ]
+        });
+
+        // スライダー & PlotDiv 参照
+        const slider = document.getElementById("timeSlider");
+        const plotDiv = document.getElementById("timeseriesPlot");
+
+        // ★ plotly_relayout ハンドラを二重登録しない
+        if (plotDiv && !plotDiv._relayoutBound) {
+
+            // 2. のズーム／パンなどで表示範囲が変化したとき
+            plotDiv.on("plotly_relayout", (event) => {
+
+                // x軸範囲が含まれていないイベントは無視
+                const xMin = event["xaxis.range[0]"];
+                const xMax = event["xaxis.range[1]"];
+                if (xMin === undefined || xMax === undefined) {
+                    return;
+                }
+
+                // xMin, xMax は秒[s]なので、カウントに戻す
+                const fsHz = AppState.samplingFreqMHz * 1e6;
+                if (!fsHz || !isFinite(fsHz)) {
+                    return;
+                }
+
+                const newMinCount = Math.round(xMin * fsHz);
+                const newMaxCount = Math.round(xMax * fsHz);
+
+                // 4. の有効範囲として使う min/max を更新
+                AppState.minTime = newMinCount;
+                AppState.maxTime = newMaxCount;
+
+                // currentTime が範囲外ならクランプ
+                if (AppState.currentTime == null) {
+                    AppState.currentTime = AppState.minTime;
+                } else {
+                    if (AppState.currentTime < AppState.minTime) {
+                        AppState.currentTime = AppState.minTime;
+                    }
+                    if (AppState.currentTime > AppState.maxTime) {
+                        AppState.currentTime = AppState.maxTime;
+                    }
+                }
+
+                // 現在の赤線（currentTime）を秒に変換
+                const curSec = countToSeconds(AppState.currentTime);
+
+                // 赤線の位置を再描画
+                Plotly.relayout("timeseriesPlot", {
+                    "shapes[0].x0": curSec,
+                    "shapes[0].x1": curSec
+                });
+
+                // ラベル更新（秒表記）
+                const sliderValueEl = document.getElementById("timeSliderValue");
+                if (sliderValueEl) {
+                    sliderValueEl.textContent = `time = ${curSec.toFixed(6)} s`;
+                }
+
+                // 赤線位置 → スライダー位置同期
+                const rangeCount = AppState.maxTime - AppState.minTime;
+                if (rangeCount > 0) {
+                    const pct = (AppState.currentTime - AppState.minTime) / rangeCount;
+                    slider.value = (pct * 100).toFixed(2);
+                }
+            });
+
+            // ★ 二重バインド防止フラグをここで立てる
+            plotDiv._relayoutBound = true;
+        }
+    }
+
+
+    // ---------------------------------------------
+    // 「解析」ボタンにグラフ更新を後付けする
+    // ---------------------------------------------
+    (function initTimeSeriesAfterParse() {
+        const parseBtn = document.getElementById("parseButton");
+        if (!parseBtn) return;
+
+        parseBtn.addEventListener("click", () => {
+        // 既存の解析処理（parseFpgaLog）は別のリスナーで先に実行される。
+        // その結果が AppState.parsed に入っている前提で描画する。
+        // （イベントハンドラの実行順は登録順なので、元の initUi() より後で呼ばれる）
+        setTimeout(() => {
+            if (!AppState || !AppState.parsed || !AppState.parsed.records) {
+            // 解析結果がまだなければ何もしない
+            return;
+            }
+            updateTimeSeriesPlot(AppState.parsed.records);
+            computeTimeRange();
+
+            AppState.currentTime = AppState.minTime;
+            updateIpPositionPlot(); 
+
+        }, 0);
+        });
+    })();
+
+    const slider = document.getElementById("timeSlider");
+    const sliderValue = document.getElementById("timeSliderValue");
+
+    slider.addEventListener("input", () => {
+        const pct = Number(slider.value) / 100;
+
+        // 表示する時刻（カウント）
+        let tCount = AppState.minTime + pct * (AppState.maxTime - AppState.minTime);
+
+        // ★ クランプ処理（変更②）
+        if (tCount < AppState.minTime) tCount = AppState.minTime;
+        if (tCount > AppState.maxTime) tCount = AppState.maxTime;
+
+        // 秒変換
+        const tSec = countToSeconds(tCount);
+
+        // ★ ラベル表示（秒）
+        sliderValue.textContent = `time = ${tSec.toFixed(6)} s`;
+
+        // ★ 内部状態はカウントで保持
+        AppState.currentTime = tCount;
+
+        // ★ 縦線の位置更新（X 軸は秒なので tSec で更新）
+        Plotly.relayout("timeseriesPlot", {
+            "shapes[0].x0": tSec,
+            "shapes[0].x1": tSec
+        });
+
+        // ★ IP 判定・プロット更新
+        updateIpPositionTime(tCount);
+        updateIpPositionPlot();
+    });
+
+    // ▼ Zoom ON/OFF ボタンイベント
+    const zoomBtn = document.getElementById("zoomToggleBtn");
+    if (zoomBtn) {
+        zoomBtn.addEventListener("click", () => {
+
+            // フラグ切替
+            AppState.zoomEnabled = !AppState.zoomEnabled;
+
+            // ボタン表記更新
+            zoomBtn.textContent = AppState.zoomEnabled ? "Zoom ON" : "Zoom OFF";
+
+            // レコードがあるときだけ再描画
+            if (AppState.records && AppState.records.length > 0) {
+                updateTimeSeriesPlot(AppState.records);
+            }
+        });
+    }
+
+
+  </script>
+  
+</body>
+</html>
