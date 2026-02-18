@@ -16,7 +16,7 @@ def read_config(path="config.xlsx"):
     # 型補正
     cfg["camera_fps"] = float(cfg["camera_fps"])
     cfg["fpga_sampling_hz"] = float(cfg["fpga_sampling_hz"])
-    cfg["trigger_fpga_time"] = float(cfg["trigger_fpga_time"])
+    cfg["trigger_fpga_count"] = int(cfg["trigger_fpga_count"])
     cfg["frame_start"] = int(cfg["frame_start"])
     cfg["frame_end"] = int(cfg["frame_end"])
     cfg["circle_radius"] = int(cfg["circle_radius"])
@@ -165,6 +165,10 @@ def main():
     print("config loaded")
 
     records = parse_fpga_log(cfg["fpga_log_file"])
+
+    records = [r for r in records if r["time"] > 0]
+    records = sorted(records, key=lambda r: r["time"])
+
     print("fpga parsed:", len(records))
 
     ip_df = load_ip_position(cfg["ip_position_csv"])
@@ -184,7 +188,7 @@ def main():
     fs = cfg["fpga_sampling_hz"]
     fps = cfg["camera_fps"]
 
-    trigger_fpga_count = cfg["trigger_fpga_time"] * fs
+    trigger_fpga_count = cfg["trigger_fpga_count"]
 
     print("start rendering...")
 
