@@ -1,0 +1,8 @@
+cd "C:\Users\yatsu\OneDrive - HIT\00000000_作業領域\Git\image_draw"
+
+
+
+python main.py
+
+
+

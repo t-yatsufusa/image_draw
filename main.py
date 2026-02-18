@@ -118,8 +118,8 @@ def draw_ip_overlay(img, ip_df, bits, cfg):
     for _, row in ip_df.iterrows():
 
         idx = row["idx"]
-        x = int(row["x"])
-        y = int(row["y"])
+        x = int(row["x"] * cfg["mm_to_px_ax"] + cfg["mm_to_px_bx"])
+        y = int(row["y"] * cfg["mm_to_px_ay"] + cfg["mm_to_px_by"])
 
         color = on_color if bits[idx] == 1 else off_color
 
