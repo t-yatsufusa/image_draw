@@ -23,6 +23,8 @@ def read_config(path="config.xlsx"):
     cfg["font_scale"] = float(cfg["font_scale"])
     cfg["line_thickness"] = int(cfg["line_thickness"])
     cfg["draw_label"] = str(cfg["draw_label"]).upper() == "TRUE"
+    cfg["draw_scale"] = int(cfg["draw_scale"])
+
 
     return cfg
 
@@ -127,15 +129,15 @@ def draw_ip_overlay(img, ip_df, bits, cfg):
     for _, row in ip_df.iterrows():
 
         idx = row["idx"]
-        x = int(row["x"] * cfg["mm_to_px_ax"] + cfg["mm_to_px_bx"])
-        y = int(row["y"] * cfg["mm_to_px_ay"] + cfg["mm_to_px_by"])
+        x = int((row["x"] * cfg["mm_to_px_ax"] + cfg["mm_to_px_bx"]) * cfg["draw_scale"])
+        y = int((row["y"] * cfg["mm_to_px_ay"] + cfg["mm_to_px_by"]) * cfg["draw_scale"])
 
         color = on_color if bits[idx] == 1 else off_color
 
         cv2.circle(
             img,
             (x, y),
-            cfg["circle_radius"],
+            cfg["circle_radius"] * cfg["draw_scale"],
             color,
             -1
         )
@@ -203,6 +205,16 @@ def main():
             cv2.IMREAD_COLOR
         )
 
+        scale = cfg["draw_scale"]
+
+        img = cv2.resize(
+            img,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_LINEAR
+        )
+
         # frame → FPGA時間
         dt_frame = i - trigger_idx
         t_fpga = trigger_fpga_count + dt_frame * fs / fps
@@ -210,6 +222,14 @@ def main():
         bits = get_bits_at_time(records, t_fpga)
 
         img = draw_ip_overlay(img, ip_df, bits, cfg)
+
+        img = cv2.resize(
+            img,
+            None,
+            fx=1.0 / scale,
+            fy=1.0 / scale,
+            interpolation=cv2.INTER_AREA
+        )
 
         out_name = Path(img_path).name
         out_path = output_dir / out_name
