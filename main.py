@@ -86,13 +86,22 @@ def parse_fpga_log(path):
 
 
 # ======================================================
-# 時刻最近傍取得
+# 時刻取得（step / hold方式）
 # ======================================================
 
 def get_bits_at_time(records, t):
+
     times = np.array([r["time"] for r in records])
-    idx = np.argmin(np.abs(times - t))
+
+    # t 以下で最後のイベントを取得
+    idx = np.searchsorted(times, t, side="right") - 1
+
+    # t が最初の記録より前の場合
+    if idx < 0:
+        return records[0]["bits"]
+
     return records[idx]["bits"]
+
 
 
 # ======================================================
