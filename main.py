@@ -194,7 +194,10 @@ def main():
             break
 
         img_path = image_list[i]
-        img = cv2.imread(img_path)
+        img = cv2.imdecode(
+            np.fromfile(img_path, dtype=np.uint8),
+            cv2.IMREAD_COLOR
+        )
 
         # frame → FPGA時間
         dt_frame = i - trigger_idx
@@ -207,7 +210,14 @@ def main():
         out_name = Path(img_path).name
         out_path = output_dir / out_name
 
-        cv2.imwrite(str(out_path), img)
+        ext = out_path.suffix  # ".jpg" など
+
+        result, encoded = cv2.imencode(ext, img)
+
+        if result:
+            encoded.tofile(str(out_path))
+        else:
+            print("save failed:", out_path)
 
         if i % 100 == 0:
             print("frame:", i)
